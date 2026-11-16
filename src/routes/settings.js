@@ -13,8 +13,8 @@ router.get("/", async (req, res) => {
   res.json({ ok: true, settings: await getSettings(req.user.locationId) });
 });
 
-/** PUT /api/settings — admins only. Send the whole object; the audit trail records what changed. */
-router.put("/", requireRole("GLOBAL_ADMIN", "LOCATION_ADMIN"), async (req, res) => {
+/** PUT /api/settings — global admins only (the Control Panel). Send the whole object; the audit trail records what changed. */
+router.put("/", requireRole("GLOBAL_ADMIN"), async (req, res) => {
   const parsed = SettingsSchema.safeParse(req.body);
   if (!parsed.success) {
     const message = Object.values(parsed.error.flatten().fieldErrors).flat()[0] ?? "Some settings are missing or invalid.";
@@ -36,21 +36,24 @@ router.put("/", requireRole("GLOBAL_ADMIN", "LOCATION_ADMIN"), async (req, res) 
 
 /**
  * GET /api/settings/kiosk — this location's kiosk link (admins only: anyone with it can use the kiosk).
- * The first call creates it. url is null if it can't be shown any more, in which case regenerate it.
+ * The first call creates it. url is null if it can't be shown any more, in which case a global admin regenerates it.
+ * The 6-digit kiosk code is only sent to global admins; a location admin gets the link without it.
  */
 router.get("/kiosk", requireRole("GLOBAL_ADMIN", "LOCATION_ADMIN"), async (req, res) => {
-  res.json({ ok: true, ...(await getKioskLink(req.user.locationId)), code: await getKioskCode(req.user.locationId) });
+  const link = await getKioskLink(req.user.locationId);
+  if (req.user.role !== "GLOBAL_ADMIN") return res.json({ ok: true, ...link });
+  res.json({ ok: true, ...link, code: await getKioskCode(req.user.locationId) });
 });
 
-/** POST /api/settings/kiosk/regenerate — turns the old link off for good and returns a new one */
-router.post("/kiosk/regenerate", requireRole("GLOBAL_ADMIN", "LOCATION_ADMIN"), async (req, res) => {
+/** POST /api/settings/kiosk/regenerate — global admins only. Turns the old link off for good and returns a new one */
+router.post("/kiosk/regenerate", requireRole("GLOBAL_ADMIN"), async (req, res) => {
   const link = await regenerateKioskLink(req.user.locationId);
   await audit("KIOSK_TOKEN_REGENERATED", "Security", req.user);
   res.json({ ok: true, ...link });
 });
 
-/** POST /api/settings/kiosk/code/regenerate — a new 6-digit kiosk code. Tablets unlocked with the old one ask for the new one. */
-router.post("/kiosk/code/regenerate", requireRole("GLOBAL_ADMIN", "LOCATION_ADMIN"), async (req, res) => {
+/** POST /api/settings/kiosk/code/regenerate — global admins only. A new 6-digit kiosk code. Tablets unlocked with the old one ask for the new one. */
+router.post("/kiosk/code/regenerate", requireRole("GLOBAL_ADMIN"), async (req, res) => {
   const code = await regenerateKioskCode(req.user.locationId);
   await audit("KIOSK_CODE_REGENERATED", "Security", req.user);
   res.json({ ok: true, code });
