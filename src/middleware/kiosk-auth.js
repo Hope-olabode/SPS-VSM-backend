@@ -1,5 +1,5 @@
 import { one } from "../db.js";
-import { checkKioskCode, hashToken } from "../utils/kiosk-token.js";
+import { checkKioskUnlockProof, hashToken, makeKioskUnlockProof } from "../utils/kiosk-token.js";
 
 // Failed attempts per IP, kept in memory (fine for one server). A real kiosk link never fails,
 // so a burst of failures means someone is guessing.
@@ -40,19 +40,31 @@ export async function requireKioskToken(req, res, next) {
     recordFail(req.ip);
     return res.status(401).json({ ok: false, error: "This kiosk link isn't valid any more. Ask staff for the new one." });
   }
-  req.kiosk = { locationId: row.location_id, locationName: row.name };
+  req.kiosk = { locationId: row.location_id, locationName: row.name, tokenHash: hashToken(token) };
   next();
 }
 
+// The tablet keeps an httpOnly cookie (one per kiosk link) that proves the code was entered; it never holds the code itself.
+const UNLOCK_MAX_AGE_MS = 180 * 24 * 60 * 60 * 1000; // about 6 months; regenerating the code or the link ends it sooner
+const unlockCookie = (kiosk) => `kiosk_${kiosk.tokenHash.slice(0, 16)}`;
+const unlockCookieOptions = { httpOnly: true, sameSite: "lax", secure: process.env.NODE_ENV === "production", path: "/" };
+
+/** Called right after the right code was entered: hands the tablet its proof */
+export async function setKioskUnlocked(res, kiosk) {
+  const proof = await makeKioskUnlockProof(kiosk.locationId, kiosk.tokenHash);
+  if (proof) res.cookie(unlockCookie(kiosk), proof, { ...unlockCookieOptions, maxAge: UNLOCK_MAX_AGE_MS });
+}
+
 /**
- * Step 2 of 2. The tablet also sends the location's 6-digit access code in the x-kiosk-code header (an admin reads it
- * from the Locations page). Without it, or with a wrong one, the answer is 423 and the kiosk shows its code screen.
+ * Step 2 of 2. The tablet must have been unlocked with the location's 6-digit access code (POST /api/kiosk/unlock), which
+ * gave it an httpOnly cookie as proof. Without that cookie, or after the code or the link was regenerated, the answer is 423
+ * and the kiosk shows its code screen. The code itself is only ever sent once, to /unlock, and is never kept on the tablet.
  */
 export async function requireKioskCode(req, res, next) {
-  const code = req.get("x-kiosk-code");
-  if (!code) return res.status(423).json({ ok: false, error: "Enter the kiosk code to unlock this kiosk." });
-  if (!(await checkKioskCode(req.kiosk.locationId, code))) {
-    recordFail(req.ip);
+  const proof = req.cookies?.[unlockCookie(req.kiosk)];
+  if (!proof) return res.status(423).json({ ok: false, error: "Enter the kiosk code to unlock this kiosk." });
+  // a proof can't be guessed (it is a 256-bit HMAC), so a stale one after a regenerate isn't counted as an attack
+  if (!(await checkKioskUnlockProof(req.kiosk.locationId, req.kiosk.tokenHash, proof))) {
     return res.status(423).json({ ok: false, error: "That kiosk code isn't right any more. Ask an admin for the current code." });
   }
   next();

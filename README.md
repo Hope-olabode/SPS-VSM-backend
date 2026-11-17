@@ -132,7 +132,7 @@ backend/
     ├── db.js            shared pool plus query() and one() helpers
     ├── middleware/
     │   ├── auth.js        login cookie + requireRole(...)
-    │   └── kiosk-auth.js  kiosk token + access code (no login)
+    │   └── kiosk-auth.js  kiosk token + unlock cookie (no login)
     ├── routes/          one file per feature
     └── utils/           shared logic (check-in rules, audit, SMS, uploads, maintenance...)
 ```
@@ -155,7 +155,7 @@ All routes are under `/api`. Unless noted, they need a login.
 | `/watchlist` | Blocked or flagged people | |
 | `/reports`, `/analytics` | Numbers worked out in SQL | |
 | `/audit`, `/notifications` | Audit trail and the notification bell | Audit is admin-only |
-| `/users`, `/locations`, `/settings` | Administration | Admin roles |
+| `/users`, `/locations`, `/settings` | Administration | Admin roles; saving settings and kiosk regeneration are global-admin only |
 | `/documents` | Documents visitors sign | |
 | `/sms` | Marketing SMS | Dry run unless `SMS_PROVIDER` is set |
 | `/old-records` | Archive created by data retention | Global admins |
@@ -178,8 +178,8 @@ All routes are under `/api`. Unless noted, they need a login.
 
 ### Kiosk
 
-- The tablet authenticates with the location's kiosk token (header `x-kiosk-token`) **and** a 6-digit access code (header `x-kiosk-code`; responds `423` when missing or wrong). It calls `/api/kiosk/config`, `/lookup`, `/check-in` and `/check-out`.
-- Admins get and regenerate the link at `/api/settings/kiosk`. Treat the link like a password: anyone with it can use the kiosk.
+- The tablet authenticates with the location's kiosk token (header `x-kiosk-token`) **and** by having been unlocked with the 6-digit access code. The code is sent **once**, to `POST /api/kiosk/unlock`. The server then gives the tablet an **httpOnly cookie** (`kiosk_<id>`) as proof, which page JavaScript can't read. The code itself is never stored on the tablet or sent again. The proof is tied to the link and the current code, so regenerating either one locks every tablet again (`423`). It calls `/api/kiosk/config`, `/lookup`, `/check-in` and `/check-out`.
+- Admins (global and location) read the link at `GET /api/settings/kiosk`. The 6-digit access code is only included for **global admins**. Regenerating the link or the code (`POST /api/settings/kiosk/regenerate`, `/kiosk/code/regenerate`) and saving settings (`PUT /api/settings`) are global-admin only. Treat the link like a password: anyone with it can use the kiosk.
 - **Phone-first check-in:** the visitor's number goes to `POST /api/kiosk/lookup { phone }` (rate limited: 60 per 10 minutes per IP). The server answers before the form is shown:
   - `403` for a watchlist hit (audited as `WATCHLIST_MATCH`), or when walk-ins are off and the person wasn't pre-registered for today.
   - `expected` (pre-registered today; name, company, type, host and purpose come back to fill the form), `returning` (visited before; name and company) or `new`.

@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { one, query } from "../db.js";
-import { requireKioskCode, requireKioskToken } from "../middleware/kiosk-auth.js";
+import { requireKioskCode, requireKioskToken, setKioskUnlocked } from "../middleware/kiosk-auth.js";
 import { audit } from "../utils/audit.js";
 import { CheckIn, performCheckIn } from "../utils/check-in.js";
 import { PHONE_CODES, resolvePhone } from "../utils/phone.js";
@@ -11,8 +11,9 @@ import { getSettings } from "../utils/settings.js";
 
 // What the front-desk kiosk tablet calls. There is no login: the tablet sends its token in the x-kiosk-token header
 // (the link an admin copies from the Overview or Control Panel), and the token decides which location it is for.
-// On top of the token, every route except /unlock needs the location's 6-digit kiosk code in the x-kiosk-code header
-// (admins see it on the Locations page), so a copied link alone shows nothing.
+// On top of the token, every route except /unlock needs the tablet to have been unlocked with the location's 6-digit kiosk code
+// (admins see it on the Locations page), so a copied link alone shows nothing. /unlock checks the code once and gives the
+// tablet an httpOnly cookie as proof; the code is never kept on the tablet.
 const router = Router();
 router.use(requireKioskToken);
 
@@ -20,7 +21,7 @@ const Unlock = z.object({ code: z.string().trim().regex(/^\d{6}$/) });
 // a 6-digit code has a million possibilities, so a handful of tries per IP is plenty for a person typing it in
 const unlockLimit = rateLimit({ windowMs: 10 * 60 * 1000, max: 8, message: "Too many tries. Please wait a few minutes, or ask an admin for help." });
 
-/** POST /api/kiosk/unlock { code } — the first thing a tablet does. 423 when the code is wrong; nothing else about the kiosk is revealed. */
+/** POST /api/kiosk/unlock { code } — the first thing a tablet does. Sets the tablet's proof cookie. 423 when the code is wrong; nothing else about the kiosk is revealed. */
 router.post("/unlock", unlockLimit, async (req, res) => {
   const parsed = Unlock.safeParse(req.body);
   const { locationId, locationName } = req.kiosk;
@@ -28,6 +29,7 @@ router.post("/unlock", unlockLimit, async (req, res) => {
     await audit("KIOSK_UNLOCK_FAILED", "Security", { name: "Kiosk", locationId }, { kiosk: locationName });
     return res.status(423).json({ ok: false, error: "That code isn't right. Ask an admin for this location's kiosk code." });
   }
+  await setKioskUnlocked(res, req.kiosk);
   res.json({ ok: true });
 });
 

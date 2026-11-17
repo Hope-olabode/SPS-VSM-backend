@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { one, pool, query } from "../db.js";
 
 // A kiosk token is a long random secret, like ek_9f2c... (24 random bytes = 192 bits).
@@ -111,6 +111,28 @@ export async function checkKioskCode(locationId, code) {
   const expected = Buffer.from(row.code_hash, "hex");
   const given = Buffer.from(hashCode(locationId, code), "hex");
   return expected.length === given.length && timingSafeEqual(expected, given);
+}
+
+// ----- remembering that a tablet was unlocked -----
+// After the right code is entered, the tablet is given a "proof" instead of keeping the code: an HMAC that only the server can
+// make, kept in an httpOnly cookie that the page's JavaScript can't read. It is tied to this kiosk link and the location's
+// current code, so regenerating either one makes every old proof stop working. The code itself is never stored on the tablet.
+
+const proofFor = (locationId, tokenHash, codeHash) =>
+  createHmac("sha256", key()).update(`kiosk-unlock:${locationId}:${tokenHash}:${codeHash}`).digest("hex");
+
+/** The proof for this link + the location's current code, or null if the location has no code yet */
+export async function makeKioskUnlockProof(locationId, tokenHash) {
+  const row = await one("SELECT code_hash FROM kiosk_access_codes WHERE location_id = ?", [locationId]);
+  return row ? proofFor(locationId, tokenHash, row.code_hash) : null;
+}
+
+/** Is this proof still good? Compared in constant time. */
+export async function checkKioskUnlockProof(locationId, tokenHash, proof) {
+  if (typeof proof !== "string" || !/^[0-9a-f]{64}$/.test(proof)) return false;
+  const expected = await makeKioskUnlockProof(locationId, tokenHash);
+  if (!expected) return false;
+  return timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(proof, "hex"));
 }
 
 /** Every location with its code, for the admin's Locations page */
