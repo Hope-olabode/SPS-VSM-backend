@@ -135,16 +135,33 @@ router.post("/lookup", lookupLimit, async (req, res) => {
 
   // only someone who has visited this location before is recognised here, so one location can't see who has been to another
   const returning = await one(
-    "SELECT p.first_name, p.last_name, p.company FROM visitors p WHERE p.phone = ? AND EXISTS (SELECT 1 FROM visits v WHERE v.visitor_id = p.id AND v.location_id = ?)",
+    "SELECT p.id, p.first_name, p.last_name, p.company FROM visitors p WHERE p.phone = ? AND EXISTS (SELECT 1 FROM visits v WHERE v.visitor_id = p.id AND v.location_id = ?)",
     [phone, locationId],
   );
+  // what they gave last time (visitor type, resident company, person visited), so the form can be filled in with one tap
+  const last = returning
+    ? await one(
+        `SELECT v.type, v.host_name, t.name AS resident_company
+           FROM visits v LEFT JOIN tenants t ON t.id = v.tenant_id
+          WHERE v.visitor_id = ? AND v.location_id = ? ORDER BY v.check_in_at DESC LIMIT 1`,
+        [returning.id, locationId],
+      )
+    : null;
   const requiresApproval = settings.requireHostApproval;
   if (returning) {
     return res.json({
       ok: true,
       status: "returning",
       requiresApproval,
-      visitor: { firstName: returning.first_name, lastName: returning.last_name, company: returning.company, visitorType: "", residentCompany: "", host: "", purpose: "" },
+      visitor: {
+        firstName: returning.first_name,
+        lastName: returning.last_name,
+        company: returning.company,
+        visitorType: last?.type ?? "",
+        residentCompany: last?.resident_company ?? "",
+        host: last?.host_name ?? "",
+        purpose: "",
+      },
     });
   }
   res.json({ ok: true, status: "new", requiresApproval });

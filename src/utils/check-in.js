@@ -66,7 +66,8 @@ export async function performCheckIn({ data: d, locationId, actor, settings, kio
   }
   const needsApproval = kiosk && settings.requireHostApproval && !expected;
 
-  if (settings.requirePhoto && !d.photo) return refuse(400, "A photo of the visitor is required.");
+  // at the kiosk the visitor can skip the photo (the Skip button on the photo step); staff check-ins still follow "Require photo"
+  if (settings.requirePhoto && !kiosk && !d.photo) return refuse(400, "A photo of the visitor is required.");
   if (settings.requireSignature && !d.signature) return refuse(400, "The visitor must sign before checking in.");
 
   // photo and signature must be real, small images (checked before anything is saved)
