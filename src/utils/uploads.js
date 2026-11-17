@@ -45,3 +45,15 @@ export function resolveUpload(relative) {
   const full = path.resolve(UPLOADS_DIR, relative);
   return full.startsWith(UPLOADS_DIR + path.sep) ? full : null;
 }
+
+/** The most a signature image may weigh (the same limit for the check-in and the check-out signature) */
+export const MAX_SIGNATURE_BYTES = 300_000;
+
+/**
+ * Validates a check-out signature (a PNG data URL from the signature pad) without saving it.
+ * Returns the parsed image, or null when it isn't a real PNG of an allowed size.
+ */
+export const parseSignature = (dataUrl) => parseImageDataUrl(dataUrl, { allowed: ["png"], maxBytes: MAX_SIGNATURE_BYTES });
+
+/** Saves a parsed check-out signature as "checkout-signatures/<visit id>.png" and returns that relative path. */
+export const saveCheckoutSignature = (visitId, image) => saveUpload("checkout-signatures", visitId, image);

@@ -4,7 +4,7 @@ import { requireAuth } from "../middleware/auth.js";
 import { audit } from "../utils/audit.js";
 import { CheckIn, performCheckIn } from "../utils/check-in.js";
 import { getSettings } from "../utils/settings.js";
-import { resolveUpload } from "../utils/uploads.js";
+import { deleteUpload, parseSignature, resolveUpload, saveCheckoutSignature } from "../utils/uploads.js";
 
 const router = Router();
 router.use(requireAuth); // everything below needs a signed-in user
@@ -143,8 +143,11 @@ router.post("/:id/decline-clearance", async (req, res) => {
   );
   if (!visit) return res.status(404).json({ ok: false, error: "Visit not found." });
 
-  const done = await query("UPDATE visits SET status = 'ONSITE', clearance_requested_at = NULL WHERE id = ? AND status = 'PENDING_CLEARANCE'", [visit.id]);
+  const pending = await one("SELECT checkout_signature_url FROM visits WHERE id = ?", [visit.id]);
+  const done = await query("UPDATE visits SET status = 'ONSITE', clearance_requested_at = NULL, checkout_signature_url = NULL WHERE id = ? AND status = 'PENDING_CLEARANCE'", [visit.id]);
   if (done.affectedRows === 0) return res.status(409).json({ ok: false, error: "This check-out is no longer waiting for clearance. Refresh to see the latest." });
+  // the visitor is still inside and will sign again when they leave, so the signature they gave for this attempt goes
+  if (pending?.checkout_signature_url) await deleteUpload(pending.checkout_signature_url);
 
   await audit("VISITOR_CLEARANCE_DECLINED", "Visitor", req.user, { visitId: visit.id, visitor: `${visit.first_name} ${visit.last_name}` });
   res.json({ ok: true, status: "onsite" });
@@ -194,7 +197,10 @@ router.post("/check-out-all", async (req, res) => {
   }
 });
 
-/** POST /api/visitors/:id/check-out */
+/**
+ * POST /api/visitors/:id/check-out { signature } — staff sign a visitor out. The visitor's signature (a PNG data URL from the
+ * signature pad) is required and is saved as a file; the database keeps only its path in visits.checkout_signature_url.
+ */
 router.post("/:id/check-out", async (req, res) => {
   const visit = await one(
     "SELECT v.id, v.status, p.first_name, p.last_name, p.phone FROM visits v JOIN visitors p ON p.id = v.visitor_id WHERE v.id = ? AND v.location_id = ?",
@@ -204,7 +210,26 @@ router.post("/:id/check-out", async (req, res) => {
   if (visit.status === "LEFT") return res.status(409).json({ ok: false, error: "Already checked out." });
   if (visit.status === "DECLINED") return res.status(409).json({ ok: false, error: "This visitor was not let in, so there is nothing to check out." });
 
-  await query("UPDATE visits SET status = 'LEFT', check_out_at = NOW() WHERE id = ?", [visit.id]);
+  if (!req.body?.signature) return res.status(400).json({ ok: false, error: "The visitor must sign before checking out." });
+  const signature = parseSignature(req.body.signature);
+  if (!signature) return res.status(400).json({ ok: false, error: "The signature isn't a valid image, or it is too large." });
+
+  // file first, then the row; if the row can't be updated the file is removed again so nothing is left behind
+  const signaturePath = await saveCheckoutSignature(visit.id, signature);
+  try {
+    const done = await query(
+      "UPDATE visits SET status = 'LEFT', check_out_at = NOW(), clearance_requested_at = NULL, checkout_signature_url = ? WHERE id = ? AND status IN ('PENDING_APPROVAL', 'ONSITE', 'PENDING_CLEARANCE')",
+      [signaturePath, visit.id],
+    );
+    if (done.affectedRows === 0) {
+      await deleteUpload(signaturePath);
+      return res.status(409).json({ ok: false, error: "Already checked out. Refresh to see the latest." });
+    }
+  } catch (err) {
+    await deleteUpload(signaturePath);
+    throw err;
+  }
+
   await query(
     "UPDATE pre_registrations p JOIN tenants t ON t.id = p.tenant_id SET p.status = 'CHECKED_OUT' WHERE p.phone = ? AND p.status = 'CHECKED_IN' AND t.location_id = ? AND DATE(p.expected_at) = CURDATE()",
     [visit.phone, req.user.locationId],
@@ -215,10 +240,10 @@ router.post("/:id/check-out", async (req, res) => {
 });
 
 /**
- * GET /api/visitors/:id/photo and /api/visitors/:id/signature (:id is the visit id)
+ * GET /api/visitors/:id/photo, /signature and /checkout-signature (:id is the visit id)
  * Only signed-in staff at the visit's location can open them, and they are never cached.
  */
-for (const [kind, column] of [["photo", "photo_url"], ["signature", "signature_url"]]) {
+for (const [kind, column] of [["photo", "photo_url"], ["signature", "signature_url"], ["checkout-signature", "checkout_signature_url"]]) {
   router.get(`/:id/${kind}`, async (req, res) => {
     const row = await one(`SELECT ${column} AS file FROM visits WHERE id = ? AND location_id = ?`, [req.params.id, req.user.locationId]);
     const file = row?.file ? resolveUpload(row.file) : null;
@@ -240,7 +265,7 @@ for (const [kind, column] of [["photo", "photo_url"], ["signature", "signature_u
 router.get("/:id", async (req, res) => {
   const r = await one(
     `SELECT v.id, v.visitor_id, v.type, v.purpose, v.notes, v.host_name, v.status, v.check_in_at, v.check_out_at,
-            v.clearance_requested_at, v.decided_at, v.photo_url, v.signature_url,
+            v.clearance_requested_at, v.decided_at, v.photo_url, v.signature_url, v.checkout_signature_url,
             p.first_name, p.last_name, p.phone, p.email, p.company,
             t.name AS resident_company, t.floor,
             u.name AS decided_by
@@ -289,6 +314,7 @@ router.get("/:id", async (req, res) => {
       decidedAt: r.decided_at,
       hasPhoto: Boolean(r.photo_url && resolveUpload(r.photo_url)),
       hasSignature: Boolean(r.signature_url && resolveUpload(r.signature_url)),
+      hasCheckoutSignature: Boolean(r.checkout_signature_url && resolveUpload(r.checkout_signature_url)),
       documentsSigned: documents.map((d) => ({ title: d.title, signedAt: d.signed_at })),
       earlierVisits: count.total,
       recentVisits: earlier.map((e) => ({ id: e.id, type: e.type, host: e.host_name, status: e.status, checkInAt: e.check_in_at, checkOutAt: e.check_out_at })),

@@ -71,7 +71,7 @@ async function flagOverstays(locationId, hours) {
   return rows.length;
 }
 
-const ARCHIVE_COLUMNS = "id, source, original_id, location_id, name, phone, email, company, job_title, type, host_name, purpose, notes, resident_company, floor, status, event_title, record_at, check_out_at, auto_checked_out, photo_url, signature_url, documents_signed";
+const ARCHIVE_COLUMNS = "id, source, original_id, location_id, name, phone, email, company, job_title, type, host_name, purpose, notes, resident_company, floor, status, event_title, record_at, check_out_at, auto_checked_out, photo_url, signature_url, checkout_signature_url, documents_signed";
 
 /** Run several statements in one transaction: all of them or none */
 async function inTransaction(work) {
@@ -131,7 +131,7 @@ async function applyRetention(locationId, days, { dryRun = false } = {}) {
       await run(
         `INSERT INTO old_records (${ARCHIVE_COLUMNS})
          SELECT UUID(), 'VISIT', v.id, v.location_id, CONCAT(p.first_name, ' ', p.last_name), p.phone, p.email, p.company, NULL, v.type, v.host_name, v.purpose, v.notes,
-                t.name, t.floor, v.status, v.check_in_at, v.check_out_at, v.auto_checked_out, v.photo_url, v.signature_url,
+                t.name, t.floor, v.status, v.check_in_at, v.check_out_at, v.auto_checked_out, v.photo_url, v.signature_url, v.checkout_signature_url,
                 (SELECT JSON_ARRAYAGG(JSON_OBJECT('title', d.title, 'signedAt', ds.signed_at)) FROM document_signatures ds JOIN documents d ON d.id = ds.document_id WHERE ds.visit_id = v.id)
            FROM visits v JOIN visitors p ON p.id = v.visitor_id LEFT JOIN tenants t ON t.id = v.tenant_id
           WHERE v.id IN (${marks})`,
@@ -195,7 +195,7 @@ async function applyRetention(locationId, days, { dryRun = false } = {}) {
   // ── stage 2: old enough in the archive, so the personal details go ──
   for (;;) {
     const rows = await query(
-      `SELECT id, photo_url, signature_url FROM old_records WHERE location_id = ? AND anonymized_at IS NULL AND record_at < ${age} LIMIT ${BATCH}`,
+      `SELECT id, photo_url, signature_url, checkout_signature_url FROM old_records WHERE location_id = ? AND anonymized_at IS NULL AND record_at < ${age} LIMIT ${BATCH}`,
       [locationId, stage2],
     );
     if (rows.length === 0) break;
@@ -204,10 +204,11 @@ async function applyRetention(locationId, days, { dryRun = false } = {}) {
     for (const r of rows) {
       if (r.photo_url) await deleteUpload(r.photo_url);
       if (r.signature_url) await deleteUpload(r.signature_url);
+      if (r.checkout_signature_url) await deleteUpload(r.checkout_signature_url);
     }
     await query(
       `UPDATE old_records SET name = 'Deleted visitor', phone = NULL, email = NULL, company = '', job_title = NULL, notes = NULL,
-              photo_url = NULL, signature_url = NULL, documents_signed = NULL, anonymized_at = NOW()
+              photo_url = NULL, signature_url = NULL, checkout_signature_url = NULL, documents_signed = NULL, anonymized_at = NOW()
         WHERE id IN (${ids.map(() => "?").join(", ")})`,
       ids,
     );

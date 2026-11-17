@@ -8,6 +8,7 @@ import { PHONE_CODES, resolvePhone } from "../utils/phone.js";
 import { checkKioskCode } from "../utils/kiosk-token.js";
 import { rateLimit } from "../utils/rate-limit.js";
 import { getSettings } from "../utils/settings.js";
+import { deleteUpload, parseSignature, saveCheckoutSignature } from "../utils/uploads.js";
 
 // What the front-desk kiosk tablet calls. There is no login: the tablet sends its token in the x-kiosk-token header
 // (the link an admin copies from the Overview or Control Panel), and the token decides which location it is for.
@@ -274,10 +275,11 @@ router.post("/pass-check-in", lookupLimit, async (req, res) => {
   res.status(status).json(body);
 });
 
-const CheckOut = z.object({ phoneCode: z.enum(PHONE_CODES).default("+234"), phone: z.string().trim().min(1) });
+const CheckOut = z.object({ phoneCode: z.enum(PHONE_CODES).default("+234"), phone: z.string().trim().min(1), signature: z.string().optional() });
 
 /**
- * POST /api/kiosk/check-out — a visitor leaving. With "Require staff clearance" on, the visit waits as PENDING_CLEARANCE
+ * POST /api/kiosk/check-out { phoneCode, phone, signature } — a visitor leaving. They must sign (a PNG data URL from the signature pad,
+ * saved as a file; the database keeps its path). With "Require staff clearance" on, the visit waits as PENDING_CLEARANCE
  * (staff approve it from the Overview or Visitor Log); otherwise they are checked out straight away.
  */
 router.post("/check-out", async (req, res) => {
@@ -301,14 +303,40 @@ router.post("/check-out", async (req, res) => {
 
   if (visit.status === "PENDING_CLEARANCE") return res.json({ ok: true, status: "pending_clearance" });
 
+  if (!parsed.data.signature) return res.status(400).json({ ok: false, error: "Please sign to confirm you are leaving." });
+  const image = parseSignature(parsed.data.signature);
+  if (!image) return res.status(400).json({ ok: false, error: "The signature isn't a valid image, or it is too large." });
+
   const { requireCheckoutClearance } = await getSettings(locationId);
-  if (requireCheckoutClearance) {
-    await query("UPDATE visits SET status = 'PENDING_CLEARANCE', clearance_requested_at = NOW() WHERE id = ?", [visit.id]);
-    await audit("KIOSK_CHECKOUT_REQUESTED", "Visitor", actor, { visitId: visit.id, visitor, kiosk: req.kiosk.locationName });
-    return res.json({ ok: true, status: "pending_clearance" });
+  // file first, then the row; if the row isn't updated the file is removed again so nothing is left behind
+  const signaturePath = await saveCheckoutSignature(visit.id, image);
+  try {
+    if (requireCheckoutClearance) {
+      const done = await query(
+        "UPDATE visits SET status = 'PENDING_CLEARANCE', clearance_requested_at = NOW(), checkout_signature_url = ? WHERE id = ? AND status = 'ONSITE'",
+        [signaturePath, visit.id],
+      );
+      if (done.affectedRows === 0) {
+        await deleteUpload(signaturePath);
+        return res.json({ ok: true, status: "pending_clearance" }); // someone else just moved it on; same answer as above
+      }
+      await audit("KIOSK_CHECKOUT_REQUESTED", "Visitor", actor, { visitId: visit.id, visitor, kiosk: req.kiosk.locationName });
+      return res.json({ ok: true, status: "pending_clearance" });
+    }
+
+    const done = await query(
+      "UPDATE visits SET status = 'LEFT', check_out_at = NOW(), checkout_signature_url = ? WHERE id = ? AND status = 'ONSITE'",
+      [signaturePath, visit.id],
+    );
+    if (done.affectedRows === 0) {
+      await deleteUpload(signaturePath);
+      return res.status(404).json({ ok: false, error: "We couldn't find a current visit for that number. Please see the front desk." });
+    }
+  } catch (err) {
+    await deleteUpload(signaturePath);
+    throw err;
   }
 
-  await query("UPDATE visits SET status = 'LEFT', check_out_at = NOW() WHERE id = ?", [visit.id]);
   await query(
     "UPDATE pre_registrations p JOIN tenants t ON t.id = p.tenant_id SET p.status = 'CHECKED_OUT' WHERE p.phone = ? AND p.status = 'CHECKED_IN' AND t.location_id = ? AND DATE(p.expected_at) = CURDATE()",
     [phone, locationId],

@@ -75,6 +75,45 @@ router.post("/", canManage, async (req, res) => {
   res.status(201).json({ ok: true, entry: toApi(await one("SELECT * FROM watchlist WHERE id = ?", [id])) });
 });
 
+/**
+ * POST /api/watchlist/from-visit/:visitId — puts the person behind a visit on the watchlist (the Visitor Log's "Add to Watchlist").
+ * The name, phone, email and company come from the visit itself, so the full phone number is saved even when staff only see it masked.
+ */
+router.post("/from-visit/:visitId", canManage, async (req, res) => {
+  const parsed = z
+    .object({
+      severity: z.enum(SEVERITIES).default("Medium"),
+      reason: z.string().trim().min(1, "Describe the reason for watchlisting"),
+    })
+    .safeParse(req.body);
+  if (!parsed.success) {
+    const first = Object.values(parsed.error.flatten().fieldErrors).flat()[0];
+    return res.status(400).json({ ok: false, error: first ?? "Some details are missing or invalid." });
+  }
+
+  const visit = await one(
+    `SELECT p.first_name, p.last_name, p.phone, p.email, p.company
+       FROM visits v JOIN visitors p ON p.id = v.visitor_id
+      WHERE v.id = ? AND v.location_id = ?`,
+    [req.params.visitId, req.user.locationId],
+  );
+  if (!visit) return res.status(404).json({ ok: false, error: "Visit not found." });
+
+  if (visit.phone && (await one("SELECT id FROM watchlist WHERE phone = ? LIMIT 1", [visit.phone]))) {
+    return res.status(409).json({ ok: false, error: "This visitor is already on the watchlist." });
+  }
+
+  const id = randomUUID();
+  const d = parsed.data;
+  await query(
+    "INSERT INTO watchlist (id, first_name, last_name, email, phone, company, severity, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    [id, visit.first_name, visit.last_name, visit.email || null, visit.phone, visit.company ?? "", d.severity.toUpperCase(), d.reason],
+  );
+  await audit("WATCHLIST_ADDED", "Security", req.user, { entryId: id, name: `${visit.first_name} ${visit.last_name}`, severity: d.severity });
+
+  res.status(201).json({ ok: true, entry: toApi(await one("SELECT * FROM watchlist WHERE id = ?", [id])) });
+});
+
 /** DELETE /api/watchlist/:id */
 router.delete("/:id", canManage, async (req, res) => {
   const row = await one("SELECT id, first_name, last_name FROM watchlist WHERE id = ?", [req.params.id]);
